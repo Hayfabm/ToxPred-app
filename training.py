@@ -2,9 +2,18 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
+import timeit
+import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import neptune.new as neptune
+
+
+import warnings
+
+warnings.filterwarnings("ignore")
+
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -30,13 +39,15 @@ def split_dataset(dataset, ratio):
     return dataset_1, dataset_2
 
 
+model_path = "logs/model_" + datetime.datetime.now().strftime("%Y%m%d%H%M%S") + ".hdf5"
+
 """Load preprocessed data."""
 dir_input1 = "Data/rdkit/"
 dir_input2 = "Data/embeddings/"
 compounds = load_tensor(dir_input1 + "compounds", torch.LongTensor)
 adjacencies = load_tensor(dir_input1 + "adjacencies", torch.FloatTensor)
 embeddings = load_tensor(dir_input2 + "embeddings", torch.FloatTensor)
-
+print(type(compounds))
 
 labels = load_tensor(dir_input1 + "labels", torch.LongTensor)
 fingerprint_dict = load_pickle(dir_input1 + "fingerprint_dict.pickle")
@@ -47,152 +58,169 @@ dataset = list(zip(compounds, adjacencies, embeddings, labels))
 dataset = shuffle_dataset(dataset, 1234)
 dataset_train, dataset_test = split_dataset(dataset, 0.85)
 
+if __name__ == "__main__":
+    # init neptune logger
+    run = neptune.init(
+        project="sophiedalentour/ToxPred",
+        name="peptide classification",
+        tags=["pytorch", "GNN-self_attention-CNN"],
+        capture_hardware_metrics=False,
+    )
 
-class AttentionPrediction(nn.Module):
-    def __init__(self):
-        super(AttentionPrediction, self).__init__()
-        self.embed_fingerprint = torch.nn.Embedding(n_fingerprint, dim)
-        self.W_gnn = torch.nn.ModuleList(
-            [torch.nn.Linear(dim, dim) for _ in range(layer_gnn)]
-        )
+    class AttentionPrediction(nn.Module):
+        def __init__(self):
+            super(AttentionPrediction, self).__init__()
+            self.embed_fingerprint = torch.nn.Embedding(n_fingerprint, dim)
+            self.W_gnn = torch.nn.ModuleList(
+                [torch.nn.Linear(dim, dim) for _ in range(layer_gnn)]
+            )
 
-        self.final_h = nn.Parameter(torch.randn(1, 75 * 4 + dim))
-        self.conv1 = torch.nn.Conv2d(
-            in_channels=1,
-            out_channels=64,
-            kernel_size=(1, 1024),
-            stride=(1, 1),
-            padding=(0, 0),
-        )
+            self.final_h = nn.Parameter(torch.randn(1, 75 * 4 + dim))
 
-        self.rnn = torch.nn.GRU(
-            input_size=64 * 1,
-            hidden_size=75,
-            num_layers=2,
-            bidirectional=True,
-            dropout=0.2,
-        )
+            self.conv1 = torch.nn.Conv2d(
+                in_channels=1,
+                out_channels=64,
+                kernel_size=(1, 1280),
+                stride=(1, 1),
+                padding=(0, 0),
+            )
 
-        self.W_s1 = nn.Linear(75 * 4 + dim, da)
-        self.W_s2 = nn.Linear(da, 1)
+            self.rnn = torch.nn.GRU(
+                input_size=64 * 1,
+                hidden_size=75,
+                num_layers=2,
+                bidirectional=True,
+                dropout=0.3,
+            )
 
-        self.fc1 = torch.nn.Linear(75 * 4 + dim, units)
+            self.W_s1 = nn.Linear(75 * 4 + dim, da)
+            self.W_s2 = nn.Linear(da, 1)
 
-        self.fc2 = torch.nn.Linear(units, 2)
+            self.fc1 = torch.nn.Linear(75 * 4 + dim, units)
 
-    def gnn(self, xs, A, layer):
-        gnn_median = []
-        for i in range(layer):
-            hs = torch.relu(self.W_gnn[i](xs))
-            xs = xs + torch.matmul(A, hs)
-            temp = torch.mean(xs, 0)
-            temp = temp.squeeze(0)
-            temp = temp.unsqueeze(0)
-            gnn_median.append(temp)
-        return gnn_median
+            self.fc2 = torch.nn.Linear(units, 2)
 
-    def cnn(self, x):
-        x = x.unsqueeze(0)
-        x = x.unsqueeze(0)
-        x = self.conv1(x)
-        x = torch.nn.ReLU()(x)
-        x = x.view(x.size(0), -1)
-        x = x.unsqueeze(0)
-        output, hidden = self.rnn(x)
-        return torch.cat([hidden[-1], hidden[-2], hidden[-3], hidden[-4]], dim=1)
+        def gnn(self, xs, A, layer):
+            gnn_median = []
+            for i in range(layer):
+                hs = torch.relu(self.W_gnn[i](xs))
+                xs = xs + torch.matmul(A, hs)
+                temp = torch.mean(xs, 0)
+                temp = temp.squeeze(0)
+                temp = temp.unsqueeze(0)
+                gnn_median.append(temp)
+            return gnn_median
 
-    def selfattention(self, cat_vector):
+        def cnn(self, x):
+            x = x.unsqueeze(0)
+            x = x.unsqueeze(0)
+            x = self.conv1(x)
+            x = torch.nn.ReLU()(x)
+            x = x.view(x.size(0), -1)
+            x = x.unsqueeze(0)
+            output, hidden = self.rnn(x)
+            return torch.cat([hidden[-1], hidden[-2], hidden[-3], hidden[-4]], dim=1)
 
-        attn_weight_matrix = self.W_s2(F.tanh(self.W_s1(cat_vector)))
-        attn_weight_matrix = attn_weight_matrix.permute(0, 2, 1)
-        attn_weight_matrix = F.softmax(attn_weight_matrix, dim=1)
+        def selfattention(self, cat_vector):
 
-        return attn_weight_matrix
+            attn_weight_matrix = self.W_s2(F.tanh(self.W_s1(cat_vector)))
+            attn_weight_matrix = attn_weight_matrix.permute(0, 2, 1)
+            attn_weight_matrix = F.softmax(attn_weight_matrix, dim=1)
 
-    def forward(self, gnn_peptide, gnn_adjacencies, cnn_embeddings):
+            return attn_weight_matrix
 
-        """Peptide vector with GNN."""
-        fingerprint_vectors = self.embed_fingerprint(gnn_peptide)
-        gnn_vectors = self.gnn(fingerprint_vectors, gnn_adjacencies, layer_gnn)
-        self.feature1 = gnn_vectors
+        def forward(self, gnn_peptide, gnn_adjacencies, cnn_embeddings):
 
-        """Peptide vector with CNN based on embedding."""
-        cnn_vectors = self.cnn(cnn_embeddings)
-        self.feature2 = cnn_vectors
+            """Peptide vector with GNN."""
+            fingerprint_vectors = self.embed_fingerprint(gnn_peptide)
+            gnn_vectors = self.gnn(fingerprint_vectors, gnn_adjacencies, layer_gnn)
+            self.feature1 = gnn_vectors
 
-        """Concatenate the above three vectors and output the prediction."""
-        vector = []
-        for i in range(layer_gnn):
-            vector.append(torch.cat([gnn_vectors[i], cnn_vectors], dim=1))
-        all_vector = vector[0]
-        for i in range(1, layer_gnn):
-            all_vector = torch.cat((all_vector, vector[i]), 0)
+            """Peptide vector with CNN based on embedding."""
+            cnn_vectors = self.cnn(cnn_embeddings)
+            self.feature2 = cnn_vectors
 
-        all_vector = all_vector.unsqueeze(0)
+            """Concatenate the above three vectors and output the prediction."""
+            vector = []
+            for i in range(layer_gnn):
+                vector.append(torch.cat([gnn_vectors[i], cnn_vectors], dim=1))
+            all_vector = vector[0]
+            for i in range(1, layer_gnn):
+                all_vector = torch.cat((all_vector, vector[i]), 0)
 
-        attn_weight_matrix = self.selfattention(all_vector)
-        hidden_matrix = torch.bmm(attn_weight_matrix, all_vector)
+            all_vector = all_vector.unsqueeze(0)
 
-        x = torch.nn.functional.relu(self.fc1(hidden_matrix.view(1, -1)))
-        label = self.fc2(x)
+            attn_weight_matrix = self.selfattention(all_vector)
+            hidden_matrix = torch.bmm(attn_weight_matrix, all_vector)
 
-        prediction = torch.nn.functional.softmax(label)
-        return prediction
+            x = torch.nn.functional.relu(self.fc1(hidden_matrix.view(1, -1)))
+            label = self.fc2(x)
 
+            prediction = torch.nn.functional.softmax(label)
+            return prediction
 
-dim = 50
-layer_gnn = 4
-units = 840
-da = 160
+    dim = 50
+    layer_gnn = 5
+    units = 840
+    da = 160
 
-model = AttentionPrediction().to(device)
+    model = AttentionPrediction().to(device)
 
-loss_function = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    loss_function = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
 
-acc_list = []
-train_loss = []
-test_loss = []
-min_test_acc = 0.5
-for epoch in range(100):
-    print("epochs:", epoch)
-    total_loss = 0
-    num = 0
-    for i, (train_peptide, train_adjacencies, embeddings_train, y) in enumerate(
-        dataset_train, 1
-    ):
-        train_peptide = train_peptide.to(device)
-        train_adjacencies = train_adjacencies.to(device)
-        embeddings_train = torch.reshape(embeddings_train, (1, 1024)).to(device)
-        y = torch.Tensor([y]).long().to(device)
-        output = model(train_peptide, train_adjacencies, embeddings_train)
-        loss = loss_function(output, y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        if i % 500 == 0:
-            print(f"[ Epoch {epoch} ", end="")
-            print(f"[{i}/{len(dataset_train)}] ", end="")
-            print(f"loss={total_loss / i}")
-
-    correct = 0
-    total = len(dataset_test)
-    print("evaluating trained model ...")
-    y_pred = []
-    with torch.no_grad():
-        for test_peptide, test_adjacencies, embeddings_test, y in dataset_test:
-            test_peptide = test_peptide.to(device)
-            test_adjacencies = test_adjacencies.to(device)
-            embeddings_test = torch.reshape(embeddings_test, (1, 1024)).to(device)
+    acc_list = []
+    train_loss = []
+    test_loss = []
+    min_test_acc = 0.5
+    total_train = len(dataset_train)
+    """Start training."""
+    print("Training...")
+    start = timeit.default_timer()
+    for epoch in range(10):
+        print("epochs:", epoch)
+        total_loss = 0
+        num = 0
+        for i, (train_peptide, train_adjacencies, embeddings_train, y) in enumerate(
+            dataset_train, 1
+        ):
+            train_peptide = train_peptide.to(device)
+            train_adjacencies = train_adjacencies.to(device)
+            embeddings_train = torch.reshape(embeddings_train, (1, 1280)).to(device)
             y = torch.Tensor([y]).long().to(device)
-            output = model(test_peptide, test_adjacencies, embeddings_test)
-            #             print(output.detach().numpy())
+            output = model(train_peptide, train_adjacencies, embeddings_train)
             loss = loss_function(output, y)
-            pred = output.argmax(
-                dim=1, keepdim=True
-            )  # get the index of the max log-probability
-            correct += pred.eq(y).item()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            if i % 500 == 0:
+                print(f"[ Epoch {epoch} ", end="")
+                print(f"[{i}/{total_train}] ", end="")
+                print(f"loss={total_loss / i}")
 
-        percent = "%.4f" % (100 * correct / total)
-        print(f"Test set: Accuray {correct}/{total} {percent}%")
+        correct = 0
+        total_test = len(dataset_test)
+        print("evaluating trained model ...")
+        y_pred = []
+        with torch.no_grad():
+            for test_peptide, test_adjacencies, embeddings_test, y in dataset_test:
+                test_peptide = test_peptide.to(device)
+                test_adjacencies = test_adjacencies.to(device)
+                embeddings_test = torch.reshape(embeddings_test, (1, 1280)).to(device)
+                y = torch.Tensor([y]).long().to(device)
+                output = model(test_peptide, test_adjacencies, embeddings_test)
+                #             print(output.detach().numpy())
+                loss = loss_function(output, y)
+                pred = output.argmax(
+                    dim=1, keepdim=True
+                )  # get the index of the max log-probability
+                correct += pred.eq(y).item()
+
+            percent = "%.2f" % (100 * correct / total_test)
+            print(f"Test set: Accuray {correct}/{total_test} {percent}%")
+        torch.save(model, model_path)
+        # Log batch loss & acc
+    run["training/batch/loss"].log(total_loss / total_train)
+    run["testing/batch/acc"].log(percent)
+    run.stop()
